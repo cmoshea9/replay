@@ -53,9 +53,15 @@ const PROMPTS = {
   single:
     "You are a beat reporter covering {team_name}. Write a 3-minute audio segment about their most recent game using the data below. Cover: final score, key performers with stats, turning point of the game, and one forward-looking sentence about their next matchup. Conversational, energetic tone. Data: {game_data}",
 };
-// Appended to every prompt: keeps output TTS-ready, inside the token cap, and grounded in ESPN data only.
-const GUARD =
-  "\n\nOutput rules: return only the words to be spoken aloud, with no headings, labels, markdown, or stage directions. Use only facts present in the data; if something is not in the data, leave it out. Stay under 600 words and finish on a complete sentence.";
+// Appended to every prompt: keeps output TTS-ready and grounded in ESPN data only, and asks for stats and key plays.
+const WORD_LIMITS = { league: 850, myteams: 700, single: 450 };
+const EXTRAS = {
+  league: "Give every game at least one concrete stat for its standout player, taken from topPerformers. Spend extra time on the games with a comeback, overtime, a lead change, or a big play, using the storyline and scoringPlays fields, and describe what actually happened in those plays. Name one top play of the week. Only call something a comeback if the storyline data shows the winner overcame a deficit. For NFL games, say the week number (for example, Week 5) instead of dates or a date range. Other sports do not need a week number.",
+  myteams: "Include specific stats for the standout players, and describe the key plays and any comeback or lead changes using the storyline and scoringPlays fields. Only call something a comeback if the storyline data shows the winner overcame a deficit. For NFL games, say the week number (for example, Week 5) instead of dates or a date range. Other sports do not need a week number.",
+  single: "Use scoringPlays and storyline to explain the turning point and any comeback, and include specific stats for the key performers. If it is an NFL game, say which week it was (for example, Week 5); other sports do not need a week number.",
+};
+const guardFor = (mode) =>
+  `\n\nOutput rules: return only the words to be spoken aloud, with no headings, labels, markdown, or stage directions. Use only facts present in the data; if something is not in the data, leave it out. ${EXTRAS[mode]} Stay under ${WORD_LIMITS[mode]} words and finish on a complete sentence.`;
 
 /* ---------- Helpers ---------- */
 const pad = (n) => String(n).padStart(2, "0");
@@ -68,6 +74,16 @@ const fmtLong = (d) => d.toLocaleDateString(undefined, { weekday: "long", month:
 const fmtTime = (s) => (!isFinite(s) || s < 0 ? "0:00" : `${Math.floor(s / 60)}:${pad(Math.floor(s % 60))}`);
 const teamKey = (sport, abbr) => `${sport}:${abbr}`;
 const fallbackLogo = (sport, abbr) => `https://a.espncdn.com/i/teamlogos/${sport}/500/${String(abbr).toLowerCase()}.png`;
+// NFL weeks run Tuesday to Monday, so a week never mixes in the previous Monday night game.
+const nflWeekStart = (d) => addDays(d, -((d.getDay() - 2 + 7) % 7));
+const windowDays = (sport, anchor, span) => span === 1 ? [anchor]
+  : sport === "nfl" ? Array.from({ length: 7 }, (_, i) => addDays(nflWeekStart(anchor), i))
+  : Array.from({ length: span }, (_, i) => addDays(anchor, -i));
+const windowLabel = (tab, anchor) => {
+  if (tab === "nfl") { const st = nflWeekStart(anchor); return `${fmtShort(st)} to ${fmtShort(addDays(st, 6))}`; }
+  if (tab === "mine") return `${fmtShort(addDays(anchor, -6))} to ${fmtShort(anchor)}`;
+  return fmtLong(anchor);
+};
 const scoreOf = (s) => (s && typeof s === "object" ? s.displayValue ?? s.value : s);
 
 const spanFor = (sport, tab) => (tab === "mine" || sport === "nfl" ? 7 : 1);
@@ -152,7 +168,7 @@ async function fetchDay(sport, date) {
 
 // A multi-day window is just several single-day requests, merged.
 async function fetchScoreboard(sport, anchor, span) {
-  const days = Array.from({ length: span }, (_, i) => addDays(anchor, -i));
+  const days = windowDays(sport, anchor, span);
   const results = await Promise.allSettled(days.map((d) => fetchDay(sport, d)));
   const ok = results.filter((r) => r.status === "fulfilled");
   if (!ok.length) throw results[0].reason || new Error("ESPN request failed");
@@ -174,16 +190,78 @@ async function fetchTeamDirectory(sport) {
 }
 
 // Compact, Claude-friendly version of a game. This is the ONLY data Claude sees.
-const compactGame = (g) => ({
+const compactGame = (g, d) => ({
   sport: SPORTS[g.sport].label,
+  week: g.sport === "nfl" && g.week ? g.week : undefined,
   status: g.state === "post" ? "Final" : g.state === "in" ? "In progress" : "Scheduled",
   detail: g.detail,
   away: { team: g.teams[0] && g.teams[0].name, score: g.teams[0] && g.teams[0].score, record: g.teams[0] && g.teams[0].record },
   home: { team: g.teams[1] && g.teams[1].name, score: g.teams[1] && g.teams[1].score, record: g.teams[1] && g.teams[1].record },
-  topPerformers: g.teams.flatMap((t) => t.leaders.map((l) => ({ team: t.name, category: l.category, player: l.player, stat: l.stat }))),
+  topPerformers: d && d.topPerformers && d.topPerformers.length
+    ? d.topPerformers
+    : g.teams.flatMap((t) => t.leaders.map((l) => ({ team: t.name, category: l.category, player: l.player, stat: l.stat }))),
+  storyline: (d && d.story) || undefined,
+  scoringPlays: d && d.scoringPlays && d.scoringPlays.length ? d.scoringPlays : undefined,
   note: g.note || undefined,
   venue: g.venue || undefined,
 });
+
+// Works out comeback / lead-change facts from ESPN's own scoring plays and period scores.
+function deriveStory(s) {
+  try {
+    const comp = s.header && s.header.competitions && s.header.competitions[0];
+    if (!comp) return null;
+    const winner = (comp.competitors || []).find((c) => c.winner);
+    const story = {};
+    const plays = s.scoringPlays || [];
+    if (winner && plays.length) {
+      const wHome = winner.homeAway === "home";
+      let worst = 0, changes = 0, prev = 0;
+      plays.forEach((p) => {
+        const d = wHome ? p.homeScore - p.awayScore : p.awayScore - p.homeScore;
+        if (isNaN(d)) return;
+        if (d < worst) worst = d;
+        const sign = Math.sign(d);
+        if (sign !== 0) { if (prev !== 0 && sign !== prev) changes++; prev = sign; }
+      });
+      story.winner = winner.team && winner.team.displayName;
+      story.leadChanges = changes;
+      story.winnerLargestDeficitOvercome = worst < 0 ? -worst : 0;
+    }
+    const lines = (comp.competitors || []).map((c) => ({ team: c.team && c.team.displayName, pointsByPeriod: (c.linescores || []).map((l) => l.displayValue) }));
+    if (lines.length && lines.every((l) => l.pointsByPeriod.length)) story.periodScores = lines;
+    return Object.keys(story).length ? story : null;
+  } catch { return null; }
+}
+const scoringPlaysOf = (s, n = 16) => (s.scoringPlays || []).slice(0, n).map((p) => ({
+  period: p.period && p.period.number,
+  clock: p.clock && p.clock.displayValue,
+  team: p.team && (p.team.abbreviation || p.team.displayName),
+  play: p.text ? String(p.text).slice(0, 170) : undefined,
+  awayScore: p.awayScore,
+  homeScore: p.homeScore,
+}));
+
+// One extra ESPN request per game: top stats, key plays, and comeback facts.
+async function fetchGameDetails(g) {
+  try {
+    const r = await fetch(`${ESPN}${SPORTS[g.sport].path}/summary?event=${g.eventId}`);
+    if (!r.ok) return null;
+    const s = await r.json();
+    const topPerformers = (s.leaders || []).flatMap((t) => (t.leaders || []).slice(0, 3).map((l) => ({
+      team: t.team && t.team.displayName,
+      category: l.displayName,
+      player: l.leaders && l.leaders[0] && l.leaders[0].athlete && l.leaders[0].athlete.displayName,
+      stat: l.leaders && l.leaders[0] && l.leaders[0].displayValue,
+    }))).filter((x) => x.player);
+    return { topPerformers, story: deriveStory(s), scoringPlays: scoringPlaysOf(s) };
+  } catch { return null; }
+}
+async function fetchDetailsFor(games) {
+  const live = games.filter((g) => g.state !== "pre");
+  const res = await Promise.all(live.map((g) => fetchGameDetails(g)));
+  return Object.fromEntries(live.map((g, i) => [g.id, res[i]]));
+}
 
 async function fetchTeamData(team) {
   const base = `${ESPN}${SPORTS[team.sport].path}`;
@@ -204,9 +282,10 @@ async function fetchTeamData(team) {
   if (!last) throw new Error(`No finished ${team.name} game found in the last 5 weeks. The season may not have started yet.`);
 
   // 2. Game details (optional extras)
-  let leaders = [], scoringPlays = [];
+  let leaders = [], scoringPlays = [], story = null;
   try {
     const s = await (await fetch(`${base}/summary?event=${last.eventId}`)).json();
+    story = deriveStory(s);
     leaders = (s.leaders || []).map((t) => ({
       team: t.team && t.team.displayName,
       categories: (t.leaders || []).slice(0, 4).map((l) => ({
@@ -245,6 +324,7 @@ async function fetchTeamData(team) {
     standing: standing || undefined,
     lastGame: compactGame(last),
     keyPerformers: leaders,
+    storyline: story || undefined,
     scoringPlays,
     nextGame: next,
   };
@@ -253,7 +333,7 @@ async function fetchTeamData(team) {
 /* ==========================================================================
    LAYER 2 — Claude script generation
    ========================================================================== */
-async function callClaude(prompt, apiKey) {
+async function callClaude(prompt, apiKey, mode) {
   const r = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -264,8 +344,8 @@ async function callClaude(prompt, apiKey) {
     },
     body: JSON.stringify({
       model: "claude-sonnet-4-6",
-      max_tokens: 1000,
-      messages: [{ role: "user", content: prompt + GUARD }],
+      max_tokens: 2000,
+      messages: [{ role: "user", content: prompt + guardFor(mode) }],
     }),
   });
   if (r.status === 401) throw new Error("Your Anthropic API key was rejected. Check it in Settings.");
@@ -585,13 +665,15 @@ export default function App() {
       let prompt, title, subtitle, logos;
       const dateLabel = fmtShort(anchor);
       if (mode === "league") {
-        const data = { sport: SPORTS[tab].label, window: spanFor(tab, tab) === 1 ? fmtLong(anchor) : `${fmtShort(addDays(anchor, -6))} to ${fmtShort(anchor)}`, games: selectedGames.map(compactGame) };
+        const details = await fetchDetailsFor(selectedGames);
+        const data = { sport: SPORTS[tab].label, window: windowLabel(tab, anchor), week: weekNum || undefined, games: selectedGames.map((g) => compactGame(g, details[g.id])) };
         prompt = PROMPTS.league.replace("{game_data}", JSON.stringify(data));
-        title = `${SPORTS[tab].label} recap, ${dateLabel}`;
+        title = tab === "nfl" && weekNum ? `NFL Week ${weekNum} recap` : `${SPORTS[tab].label} recap, ${dateLabel}`;
         subtitle = `${selectedGames.length} games`;
         logos = selectedGames.slice(0, 3).flatMap((g) => g.teams.slice(0, 1).map((t) => t.logo));
       } else if (mode === "myteams") {
-        const data = { window: `${fmtShort(addDays(anchor, -6))} to ${fmtShort(anchor)}`, games: selectedGames.map(compactGame) };
+        const details = await fetchDetailsFor(selectedGames);
+        const data = { window: windowLabel("mine", anchor), games: selectedGames.map((g) => compactGame(g, details[g.id])) };
         prompt = PROMPTS.myteams.replace("{team_list}", favTeams.map((t) => t.name).join(", ")).replace("{game_data}", JSON.stringify(data));
         title = `My Teams, ${dateLabel}`;
         subtitle = `${selectedGames.length} games`;
@@ -606,7 +688,7 @@ export default function App() {
 
       // 2. Script
       setStage(2);
-      const script = await callClaude(prompt, settings.claudeKey);
+      const script = await callClaude(prompt, settings.claudeKey, mode);
       const words = script.split(/\s+/).length;
 
       // 3. Audio
@@ -712,7 +794,7 @@ export default function App() {
   const span = tab === "mine" || tab === "nfl" ? 7 : 1;
   const weekNum = tab === "nfl" ? (games.find((g) => g.week) || {}).week : null;
   const heroTitle = weekNum ? `NFL Week ${weekNum}` : heading;
-  const dateLine = span === 1 ? fmtLong(anchor) : `${fmtShort(addDays(anchor, -6))} to ${fmtShort(anchor)}`;
+  const dateLine = windowLabel(tab, anchor);
   const heroSub = `${dateLine}${tab === "all" ? " (NFL shows the 7 days ending on this date)" : ""}. ${loadingGames ? "Loading games…" : `${visible.length} ${visible.length === 1 ? "game" : "games"}. Select games to include.`}`;
   const badgeSports = SPORTS[tab] ? [tab] : SPORT_KEYS.filter((k) => visible.some((g) => g.sport === k));
   const renderGames = (list) => view === "compact" ? (
