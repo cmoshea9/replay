@@ -29,6 +29,8 @@ const DEFAULT_TEAMS = [
   { sport: "nhl", abbr: "CHI", name: "Chicago Blackhawks" },
 ];
 
+const DEFAULT_IDS = { "nfl:CHI": "3", "mlb:CHW": "4", "nba:CHI": "4", "nhl:CHI": "4" };
+
 const VOICES = [
   { id: "nPczCjzI2devNBz1zQrb", name: "Brian (deep, authoritative)" },
   { id: "pNInz6obpgDQGcFmaJgB", name: "Adam (deep, steady)" },
@@ -126,6 +128,7 @@ function normalizeEvent(ev, sport) {
   const h = comp.headlines && comp.headlines[0];
   return {
     id: `${sport}-${ev.id}`,
+    eventId: ev.id,
     sport,
     date: ev.date,
     state: ev.status.type.state, // pre | in | post
@@ -136,20 +139,31 @@ function normalizeEvent(ev, sport) {
   };
 }
 
-async function fetchScoreboard(sport, anchor, span) {
-  const dates = span === 1 ? ymd(anchor) : `${ymd(addDays(anchor, -(span - 1)))}-${ymd(anchor)}`;
-  const res = await fetch(`${ESPN}${SPORTS[sport].path}/scoreboard?dates=${dates}&limit=300`);
+async function fetchDay(sport, date) {
+  const res = await fetch(`${ESPN}${SPORTS[sport].path}/scoreboard?dates=${ymd(date)}`);
   if (!res.ok) throw new Error(`ESPN returned ${res.status} for ${SPORTS[sport].label}`);
   const j = await res.json();
   return (j.events || []).map((e) => {
     const g = normalizeEvent(e, sport);
     if (g) g.week = j.week && j.week.number;
     return g;
-  }).filter(Boolean).sort((a, b) => new Date(a.date) - new Date(b.date));
+  }).filter(Boolean);
+}
+
+// A multi-day window is just several single-day requests, merged.
+async function fetchScoreboard(sport, anchor, span) {
+  const days = Array.from({ length: span }, (_, i) => addDays(anchor, -i));
+  const results = await Promise.allSettled(days.map((d) => fetchDay(sport, d)));
+  const ok = results.filter((r) => r.status === "fulfilled");
+  if (!ok.length) throw results[0].reason || new Error("ESPN request failed");
+  const seen = new Set();
+  return ok.flatMap((r) => r.value)
+    .filter((g) => (seen.has(g.id) ? false : (seen.add(g.id), true)))
+    .sort((a, b) => new Date(a.date) - new Date(b.date));
 }
 
 async function fetchTeamDirectory(sport) {
-  const res = await fetch(`${ESPN}${SPORTS[sport].path}/teams?limit=100`);
+  const res = await fetch(`${ESPN}${SPORTS[sport].path}/teams`);
   if (!res.ok) throw new Error("teams");
   const j = await res.json();
   const list = (j.sports && j.sports[0].leagues[0].teams) || [];
@@ -172,26 +186,27 @@ const compactGame = (g) => ({
 });
 
 async function fetchTeamData(team) {
-  if (!team.id) throw new Error("Team details are still loading. Try again in a moment.");
   const base = `${ESPN}${SPORTS[team.sport].path}`;
-  const r = await fetch(`${base}/teams/${team.id}/schedule`);
-  if (!r.ok) throw new Error(`ESPN returned ${r.status} for the ${team.name} schedule`);
-  const j = await r.json();
-  const evs = (j.events || []).map((e) => ({ e, c: e.competitions && e.competitions[0] })).filter((x) => x.c);
-  const st = (x) => x.c.status && x.c.status.type && x.c.status.type.state;
-  const done = evs.filter((x) => st(x) === "post").sort((a, b) => new Date(b.e.date) - new Date(a.e.date));
-  const next = evs.filter((x) => st(x) === "pre").sort((a, b) => new Date(a.e.date) - new Date(b.e.date));
-  if (!done.length) throw new Error(`No finished games found for the ${team.name} yet.`);
-  const shape = (x) => ({
-    date: x.e.date,
-    name: x.e.name,
-    status: x.c.status.type.shortDetail,
-    teams: x.c.competitors.map((c) => ({ team: c.team && c.team.displayName, homeAway: c.homeAway, score: scoreOf(c.score), winner: !!c.winner })),
-  });
-  const last = done[0];
+  // 1. Find the team's latest finished game by scanning recent scoreboards, a week at a time.
+  const today = new Date();
+  let last = null;
+  for (let chunk = 0; chunk < 5 && !last; chunk++) {
+    const days = Array.from({ length: 7 }, (_, i) => addDays(today, -(chunk * 7 + i)));
+    const res = await Promise.allSettled(days.map((d) => fetchDay(team.sport, d)));
+    if (chunk === 0 && res.every((r) => r.status === "rejected")) {
+      throw new Error("Couldn't reach the ESPN scoreboard. Check your connection and try again.");
+    }
+    const mine = res.filter((r) => r.status === "fulfilled").flatMap((r) => r.value)
+      .filter((g) => g.state === "post" && g.teams.some((t) => t.abbr === team.abbr))
+      .sort((a, b) => new Date(b.date) - new Date(a.date));
+    if (mine.length) last = mine[0];
+  }
+  if (!last) throw new Error(`No finished ${team.name} game found in the last 5 weeks. The season may not have started yet.`);
+
+  // 2. Game details (optional extras)
   let leaders = [], scoringPlays = [];
   try {
-    const s = await (await fetch(`${base}/summary?event=${last.e.id}`)).json();
+    const s = await (await fetch(`${base}/summary?event=${last.eventId}`)).json();
     leaders = (s.leaders || []).map((t) => ({
       team: t.team && t.team.displayName,
       categories: (t.leaders || []).slice(0, 4).map((l) => ({
@@ -204,15 +219,34 @@ async function fetchTeamData(team) {
       period: p.period && p.period.number, clock: p.clock && p.clock.displayValue,
       team: p.team && p.team.displayName, text: p.text, awayScore: p.awayScore, homeScore: p.homeScore,
     }));
-  } catch { /* summary is optional */ }
+  } catch { /* optional */ }
+
+  // 3. Record and next game (optional extras)
+  let next = "No upcoming game found", record = null, standing = null;
+  try {
+    for (const ref of [team.id, team.abbr && team.abbr.toLowerCase()].filter(Boolean)) {
+      const r = await fetch(`${base}/teams/${ref}/schedule`);
+      if (!r.ok) continue;
+      const j = await r.json();
+      record = j.team && j.team.recordSummary;
+      standing = j.team && j.team.standingSummary;
+      const up = (j.events || []).map((e) => ({ e, c: e.competitions && e.competitions[0] }))
+        .filter((x) => x.c && x.c.status && x.c.status.type && x.c.status.type.state === "pre")
+        .sort((a, b) => new Date(a.e.date) - new Date(b.e.date))[0];
+      if (up) next = { date: up.e.date, name: up.e.name, status: up.c.status.type.shortDetail };
+      break;
+    }
+  } catch { /* optional */ }
+
+  const me = last.teams.find((t) => t.abbr === team.abbr);
   return {
     team: team.name,
-    record: j.team && j.team.recordSummary,
-    standing: j.team && j.team.standingSummary,
-    lastGame: shape(last),
+    record: record || (me && me.record) || undefined,
+    standing: standing || undefined,
+    lastGame: compactGame(last),
     keyPerformers: leaders,
     scoringPlays,
-    nextGame: next[0] ? shape(next[0]) : "No upcoming game on the schedule yet",
+    nextGame: next,
   };
 }
 
@@ -467,7 +501,7 @@ export default function App() {
   /* ----- favorites enriched with live ESPN logos/ids ----- */
   const favTeams = useMemo(() => favorites.map((f) => {
     const hit = (teamDir[f.sport] || []).find((t) => t.abbr === f.abbr);
-    return { ...f, key: teamKey(f.sport, f.abbr), id: hit && hit.id, logo: (hit && hit.logo) || fallbackLogo(f.sport, f.abbr) };
+    return { ...f, key: teamKey(f.sport, f.abbr), id: (hit && hit.id) || f.id || DEFAULT_IDS[teamKey(f.sport, f.abbr)], logo: (hit && hit.logo) || fallbackLogo(f.sport, f.abbr) };
   }), [favorites, teamDir]);
   const favKeys = useMemo(() => new Set(favTeams.map((t) => t.key)), [favTeams]);
   const focus = favTeams.find((t) => t.key === focusKey) || favTeams[0];
@@ -483,7 +517,7 @@ export default function App() {
       const failed = results.filter((r) => r.status === "rejected");
       setGames(ok);
       if (failed.length === results.length) {
-        setBoardError("Couldn't reach the ESPN scoreboard. Check your connection and try again.");
+        setBoardError(`Couldn't reach the ESPN scoreboard (${(failed[0].reason && failed[0].reason.message) || "request failed"}). Check your connection and try again.`);
       } else if (failed.length) {
         setBoardError("Some sports didn't load, so this board may be incomplete.");
       }
@@ -508,14 +542,15 @@ export default function App() {
     try {
       const sports = SPORTS[tab] ? [tab] : SPORT_KEYS;
       const today = new Date(); let best = null;
-      for (const sp of sports) {
-        const res = await fetch(`${ESPN}${SPORTS[sp].path}/scoreboard?dates=${ymd(addDays(today, -60))}-${ymd(today)}&limit=500`);
-        const j = await res.json();
-        (j.events || []).filter((e) => e.status.type.state === "post").forEach((e) => {
-          const d = new Date(e.date); if (!best || d > best) best = d;
-        });
+      for (let chunk = 0; chunk < 8 && !best; chunk++) {
+        const days = Array.from({ length: 7 }, (_, i) => addDays(today, -(chunk * 7 + i)));
+        const res = await Promise.allSettled(sports.flatMap((sp) => days.map((d) => fetchDay(sp, d))));
+        if (chunk === 0 && res.every((r) => r.status === "rejected")) throw new Error("network");
+        res.filter((r) => r.status === "fulfilled").flatMap((r) => r.value).filter((g) => g.state === "post")
+          .forEach((g) => { const d = new Date(g.date); if (!best || d > best) best = d; });
       }
-      if (best) setAnchor(best); else setNotice({ kind: "warn", text: "No finished games in the last 60 days. This league may be in its off-season." });
+      if (best) setAnchor(best);
+      else setNotice({ kind: "warn", text: "No finished games in the last 8 weeks. This league may be in its off-season." });
     } catch { setNotice({ kind: "warn", text: "Couldn't search for recent games. Check your connection." }); }
     setJumping(false);
   }
@@ -529,7 +564,7 @@ export default function App() {
   };
   const chooseTeam = (t) => { setFocusKey(t.key); setMode("single"); setTab(t.sport); };
   const removeTeam = (t) => setFavorites((f) => f.filter((x) => teamKey(x.sport, x.abbr) !== t.key));
-  const addTeam = (t) => { setFavorites((f) => [...f, { sport: t.sport, abbr: t.abbr, name: t.name }]); setShowAdd(false); };
+  const addTeam = (t) => { setFavorites((f) => [...f, { sport: t.sport, abbr: t.abbr, name: t.name, id: t.id }]); setShowAdd(false); };
 
   const gate = (() => {
     if (mode === "league") return SPORTS[tab] ? (selectedGames.length ? null : "Select at least one game below.") : "Open a sport tab (NFL, NBA, MLB or NHL) to recap that league.";
@@ -565,7 +600,7 @@ export default function App() {
         const data = await fetchTeamData(focus);
         prompt = PROMPTS.single.replace("{team_name}", focus.name).replace("{game_data}", JSON.stringify(data));
         title = `${focus.name} review`;
-        subtitle = data.lastGame.status;
+        subtitle = data.lastGame.detail || data.lastGame.status;
         logos = [focus.logo];
       }
 
